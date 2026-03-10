@@ -27,6 +27,11 @@
 # Optimizations for headless web requests
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+[System.Net.ServicePointManager]::DefaultConnectionLimit = 64
+
+# Proxy configuration (set to $null to disable)
+$PROXY_URL = "http://usb-ds.local:8080"
+
 $METADATA_IP = "169.254.169.254"
 $PATCH_DESC_URL = "http://${METADATA_IP}/eve/v1/patch/description.json"
 $CUSTOM_STATUS_URL = "http://${METADATA_IP}/eve/v1/app/appCustomStatus"
@@ -101,6 +106,95 @@ function Publish-CustomStatus {
     }
 }
 
+function Invoke-FileDownload {
+    param(
+        [string]$Url,
+        [string]$DestPath,
+        [string]$LogLabel,
+        [string]$ProxyUrl = $null,
+        [int]$TimeoutMs = 30000
+    )    
+    # Use native curl.exe if available for robust proxy payload streaming
+    if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
+        Write-Log -Message "Using native Windows curl.exe to download $LogLabel..."
+        $curlArgs = @("-L", "--progress-bar", "-o", $DestPath, "--max-time", ($TimeoutMs / 1000))
+        if ($ProxyUrl) {
+            $curlArgs += "-x"
+            $curlArgs += $ProxyUrl
+        }
+        $curlArgs += $Url
+        
+        $process = Start-Process -FilePath "curl.exe" -ArgumentList $curlArgs -Wait -NoNewWindow -PassThru
+        if ($process.ExitCode -eq 0 -and (Test-Path $DestPath)) {
+            Write-Log -Message "Download progress for ${LogLabel}: Finished successfully via curl."
+            return
+        } else {
+            Write-Log -Message "curl.exe failed with exit code $($process.ExitCode). Falling back to .NET WebRequest..."
+        }
+    }
+    $fileStream = $null
+    $stream = $null
+    $response = $null
+    try {
+        $request = [System.Net.HttpWebRequest]::Create($Url)
+        $request.Timeout = $TimeoutMs
+        if ($ProxyUrl) { 
+            Write-Log -Message "Configuring WebRequest to use proxy: $ProxyUrl"
+            $proxy = New-Object System.Net.WebProxy($ProxyUrl)
+            
+            # Use default system credentials for the proxy if it's required natively
+            $proxy.UseDefaultCredentials = $true
+            
+            $request.Proxy = $proxy 
+        }
+        $response = $request.GetResponse()
+        $totalSize = $response.ContentLength
+        $stream = $response.GetResponseStream()
+        $buffer = New-Object byte[] 8192
+        $fileStream = [System.IO.File]::Create($DestPath)
+
+        $downloaded = 0
+        $lastLogPercent = 0
+        $lastLogBytes = 0
+
+        do {
+            $read = $stream.Read($buffer, 0, $buffer.Length)
+            if ($read -gt 0) {
+                $fileStream.Write($buffer, 0, $read)
+                $downloaded += $read
+
+                if ($totalSize -gt 0) {
+                    $percent = [math]::Floor(($downloaded / $totalSize) * 100)
+                    if ($percent -ge ($lastLogPercent + 10) -or $downloaded -eq $totalSize) {
+                        Write-Log -Message "Download progress for ${LogLabel}: $percent% ($downloaded of $totalSize bytes)"
+                        $lastLogPercent = $percent
+                    }
+                } else {
+                    if (($downloaded - $lastLogBytes) -ge 5242880) {
+                        $mb = [math]::Round($downloaded / 1MB, 2)
+                        Write-Log -Message "Download progress for ${LogLabel}: $mb MB downloaded..."
+                        $lastLogBytes = $downloaded
+                    }
+                }
+            }
+        } while ($read -gt 0)
+
+        if ($totalSize -le 0) {
+            $mb = [math]::Round($downloaded / 1MB, 2)
+            Write-Log -Message "Download progress for ${LogLabel}: Finished ($mb MB total)"
+        }
+
+        $fileStream.Close()
+        $stream.Close()
+        $response.Close()
+    } catch {
+        if ($null -ne $fileStream) { $fileStream.Close() }
+        if ($null -ne $stream) { $stream.Close() }
+        if ($null -ne $response) { $response.Close() }
+        throw
+    }
+}
+
 function Process-Manifest {
     param( [string]$ManifestPath )
 
@@ -132,63 +226,27 @@ function Process-Manifest {
                 $fileName = if (-not [string]::IsNullOrEmpty($installer)) { $installer } else { Split-Path -Leaf $installerUrl }
                 $installerPath = Join-Path $DOWNLOAD_DIR $fileName
                 
-                # Download from URL with error handling
+                # Download from URL with error handling, proxy first then direct fallback
                 Write-Log -Message "Downloading custom installer from $installerUrl to $installerPath..."
                 try {
-                    $request = [System.Net.HttpWebRequest]::Create($installerUrl)
-                    $request.Timeout = 15000 # 15 seconds timeout for connection
-                    $response = $request.GetResponse()
-                    $totalSize = $response.ContentLength
-                    $stream = $response.GetResponseStream()
-                    $buffer = New-Object byte[] 8192
-                    $fileStream = [System.IO.File]::Create($installerPath)
-                    
-                    $downloaded = 0
-                    $lastLogPercent = 0
-                    $lastLogBytes = 0
-                    
-                    do {
-                        $read = $stream.Read($buffer, 0, $buffer.Length)
-                        if ($read -gt 0) {
-                            $fileStream.Write($buffer, 0, $read)
-                            $downloaded += $read
-                            
-                            # If server provides Content-Length
-                            if ($totalSize -gt 0) {
-                                $percent = [math]::Floor(($downloaded / $totalSize) * 100)
-                                if ($percent -ge ($lastLogPercent + 10) -or $downloaded -eq $totalSize) {
-                                    Write-Log -Message "Download progress for ${pkgId}: $percent% ($downloaded of $totalSize bytes)"
-                                    $lastLogPercent = $percent
-                                }
-                            } else {
-                                # If server doesn't provide Content-Length (Chunked Transfer), log every ~5MB
-                                if (($downloaded - $lastLogBytes) -ge 5242880) {
-                                    $mb = [math]::Round($downloaded / 1MB, 2)
-                                    Write-Log -Message "Download progress for ${pkgId}: $mb MB downloaded..."
-                                    $lastLogBytes = $downloaded
-                                }
-                            }
+                    $downloadedViaProxy = $false
+                    if ($PROXY_URL) {
+                        try {
+                            Invoke-FileDownload -Url $installerUrl -DestPath $installerPath -LogLabel $pkgId -ProxyUrl $PROXY_URL -TimeoutMs 60000
+                            $downloadedViaProxy = $true
+                        } catch {
+                            Write-Log -Message "Proxy download failed, retrying direct. Exception: $_" -Level WARNING
                         }
-                    } while ($read -gt 0)
-                    
-                    # Final log if size was unknown
-                    if ($totalSize -le 0) {
-                        $mb = [math]::Round($downloaded / 1MB, 2)
-                        Write-Log -Message "Download progress for ${pkgId}: Finished ($mb MB total)"
                     }
-                    
-                    $fileStream.Close()
-                    $stream.Close()
-                    $response.Close()
-                    
+                    if (-not $downloadedViaProxy) {
+                        Write-Log -Message "Attempting direct download without proxy..."
+                        Invoke-FileDownload -Url $installerUrl -DestPath $installerPath -LogLabel $pkgId -TimeoutMs 60000
+                    }
+
                     # Publish status right after download completes
                     $agentStatus.package_results[$pkgId] = "Download Completed. Installing..."
                     Publish-CustomStatus -StatusPayload $agentStatus
                 } catch {
-                    if ($null -ne $fileStream) { $fileStream.Close() }
-                    if ($null -ne $stream) { $stream.Close() }
-                    if ($null -ne $response) { $response.Close() }
-                    
                     Write-Log -Message "Failed to download installer from '$installerUrl'. Exception: $_" -Level ERROR
                     $agentStatus.package_results[$pkgId] = "1-Download failed"
                     $allSuccessful = $false
@@ -260,6 +318,8 @@ while ($true) {
         $response = Invoke-RestMethod -Uri $PATCH_DESC_URL -Method Get -ErrorAction Stop
 
         $statusChanged = $false
+        $envCount = @($response).Count
+        Write-Log -Message "Fetched $envCount envelopes."
 
         foreach ($envelope in $response) {
             $patchId = $envelope.PatchID
@@ -272,7 +332,10 @@ while ($true) {
                 }) -join "|"
             }
 
+            Write-Log -Message "Reviewing Envelope ID: $patchId"
+
             if ($appliedPatches.ContainsKey($patchId) -and $appliedPatches[$patchId] -eq $currentMetadata) {
+                Write-Log -Message "Envelope $patchId matches applied state. Skipping."
                 continue
             }
 
@@ -351,7 +414,9 @@ while ($true) {
                     # Attempt to decode the file assuming it might be a Base64 encoded JSON manifest
                     try {
                         $rawContent = Get-Content -Path $outPath -Raw -ErrorAction Stop
-                        $decodedBytes = [System.Convert]::FromBase64String($rawContent.Trim())
+                        # Unwrap JSON string encoding if present (e.g. "\"base64...\"")
+                        $base64String = try { $rawContent | ConvertFrom-Json -ErrorAction Stop } catch { $rawContent }
+                        $decodedBytes = [System.Convert]::FromBase64String($base64String.Trim())
                         $decodedString = [System.Text.Encoding]::UTF8.GetString($decodedBytes)
                         
                         # Validate if it's actual JSON
