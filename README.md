@@ -11,11 +11,29 @@ The agent expects a `manifest.json` file (can be Base64 encoded inside the envel
 - **Downloads:** `C:\ProgramData\ZededaAgent\Downloads`
 - **State File:** `C:\ProgramData\ZededaAgent\applied_patches.json`
 
-## Installation & Auto-Start as a Windows Service (Daemon)
+## Installation & Auto-Start as a Windows Agent
 
-To install this script automatically as a continuous background Windows Service so that it survives reboots, open an **Administrator PowerShell** prompt and run the following commands.
+This script is designed to run automatically in the background as a scheduled task or service. To install and run this script, open an **Administrator PowerShell** prompt.
 
-### Method 1: Using native Windows Service Controller (`sc.exe`)
+### Method 1: Running as a Windows Scheduled Task (Recommended)
+You can register the script as a Scheduled Task that runs continuously in the background on startup.
+
+```powershell
+# Create the scheduled task
+$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File `"C:\Path\To\ZededaAgent.ps1`""
+$trigger = New-ScheduledTaskTrigger -AtStartup
+
+# Configure settings so it runs indefinitely as a daemon and doesn't rely on AC power
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit 0
+
+$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+Register-ScheduledTask -TaskName "ZededaUpdateAgent" -Action $action -Trigger $trigger -Principal $principal -Settings $settings
+
+# Start the agent manually for the first time
+Start-ScheduledTask -TaskName "ZededaUpdateAgent"
+```
+
+### Method 2: Using native Windows Service Controller (`sc.exe`)
 This is the native way to ensure the script starts automatically in the background.
 
 ```powershell
