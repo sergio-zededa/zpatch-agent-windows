@@ -86,6 +86,7 @@ $agentStatus = @{
     agent_status = "online"
     last_update = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
     package_results = @{}
+    file_metadata = @{}
 }
 
 function Publish-CustomStatus {
@@ -334,8 +335,8 @@ while ($true) {
 
             Write-Log -Message "Reviewing Envelope ID: $patchId"
 
-            if ($appliedPatches.ContainsKey($patchId) -and $appliedPatches[$patchId] -eq $currentMetadata) {
-                Write-Log -Message "Envelope $patchId matches applied state. Skipping."
+            if ($appliedPatches.ContainsKey($patchId)) {
+                Write-Log -Message "Envelope $patchId is the same as the last applied ID. Skipping."
                 continue
             }
 
@@ -343,9 +344,25 @@ while ($true) {
             $statusChanged = $true
             $envelopeSuccess = $true
 
+            # Clear previous results so we only report status for the currently processing envelope
+            $agentStatus.package_results.Clear()
+            $agentStatus.file_metadata.Clear()
+
             $manifestFound = $null
 
             foreach ($blob in $envelope.BinaryBlobs) {
+                # Store the fileMetaData so we report it back (Decode from Base64 if possible)
+                if (-not [string]::IsNullOrWhiteSpace($blob.fileMetaData)) {
+                    try {
+                        $metaBytes = [System.Convert]::FromBase64String($blob.fileMetaData.Trim())
+                        $metaDecoded = [System.Text.Encoding]::UTF8.GetString($metaBytes)
+                        $agentStatus.file_metadata[$blob.fileName] = $metaDecoded
+                    } catch {
+                        # Fallback to the original string if it is not valid base64
+                        $agentStatus.file_metadata[$blob.fileName] = $blob.fileMetaData
+                    }
+                }
+                
                 $fileName = $blob.fileName
                 $downloadUrl = $blob.url
                 
@@ -460,6 +477,7 @@ while ($true) {
             # Mark as applied so we don't process it in the next loop, ONLY if entirely successful
             if ($envelopeSuccess) {
                 Write-Log -Message "Envelope $patchId processed successfully. Storing state."
+                $appliedPatches.Clear()
                 $appliedPatches[$patchId] = $currentMetadata
                 $appliedPatches | ConvertTo-Json | Set-Content $STATE_FILE -Encoding UTF8
                 
