@@ -33,6 +33,22 @@ Register-ScheduledTask -TaskName "ZededaUpdateAgent" -Action $action -Trigger $t
 Start-ScheduledTask -TaskName "ZededaUpdateAgent"
 ```
 
+### Optional: Running with a Custom Process Name (e.g. `ZededaAgent.exe`)
+If you want the agent to appear as `ZededaAgent.exe` in Task Manager instead of heavily generic `powershell.exe`, you can copy the PowerShell executable, rename it, and use that custom executable for your scheduled task.
+
+```powershell
+# 1. Copy powershell.exe and rename it to ZededaAgent.exe
+Copy-Item "$PSHOME\powershell.exe" -Destination "C:\Path\To\ZededaAgent.exe"
+
+# 2. Register the task using your newly named executable
+$action = New-ScheduledTaskAction -Execute "C:\Path\To\ZededaAgent.exe" -Argument "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File `"C:\Path\To\ZededaAgent.ps1`""
+$trigger = New-ScheduledTaskTrigger -AtStartup
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit 0
+$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+
+Register-ScheduledTask -TaskName "ZededaUpdateAgent" -Action $action -Trigger $trigger -Principal $principal -Settings $settings
+```
+
 ### Method 2: Using native Windows Service Controller (`sc.exe`)
 This is the native way to ensure the script starts automatically in the background.
 
