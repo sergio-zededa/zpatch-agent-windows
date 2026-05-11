@@ -86,6 +86,7 @@ $agentStatus = @{
     agent_status = "online"
     last_update = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
     package_results = @{}
+    package_stage = @{}
     file_metadata = @{}
 }
 
@@ -221,11 +222,14 @@ function Process-Manifest {
             if (-not [string]::IsNullOrEmpty($localPath)) {
                 # If a local path is provided (e.g., for uninstalling), use that directly
                 $installerPath = $localPath
+                $agentStatus.package_stage[$pkgId] = "Installing"
                 Write-Log -Message "Using provided local path: $installerPath"
             } elseif (-not [string]::IsNullOrEmpty($installerUrl)) {
                 # Determine local path for download
                 $fileName = if (-not [string]::IsNullOrEmpty($installer)) { $installer } else { Split-Path -Leaf $installerUrl }
                 $installerPath = Join-Path $DOWNLOAD_DIR $fileName
+                $agentStatus.package_stage[$pkgId] = "Downloading"
+                Publish-CustomStatus -StatusPayload $agentStatus
                 
                 # Download from URL with error handling, proxy first then direct fallback
                 Write-Log -Message "Downloading custom installer from $installerUrl to $installerPath..."
@@ -245,18 +249,20 @@ function Process-Manifest {
                     }
 
                     # Publish status right after download completes
-                    $agentStatus.package_results[$pkgId] = "Download Completed. Installing..."
+                    $agentStatus.package_stage[$pkgId] = "Installing"
                     Publish-CustomStatus -StatusPayload $agentStatus
                 } catch {
                     Write-Log -Message "Failed to download installer from '$installerUrl'. Exception: $_" -Level ERROR
-                    $agentStatus.package_results[$pkgId] = "1-Download failed"
+                    $agentStatus.package_results[$pkgId] = "Failed"
+                    $agentStatus.package_stage[$pkgId] = "Failed"
                     $allSuccessful = $false
                     Publish-CustomStatus -StatusPayload $agentStatus
                     continue
                 }
             } else {
                 Write-Log -Message "Neither installer_url nor local_path is provided for $pkgId. Skipping." -Level WARNING
-                $agentStatus.package_results[$pkgId] = "3-Installation Failed"
+                $agentStatus.package_results[$pkgId] = "Failed"
+                $agentStatus.package_stage[$pkgId] = "Failed"
                 $allSuccessful = $false
                 continue
             }
@@ -272,7 +278,8 @@ function Process-Manifest {
                     $resolvedPath = $installerPath
                 } else {
                     Write-Log -Message "Installer/Uninstaller file not found at $installerPath!" -Level WARNING
-                    $agentStatus.package_results[$pkgId] = "3-Installation Failed"
+                    $agentStatus.package_results[$pkgId] = "Failed"
+                    $agentStatus.package_stage[$pkgId] = "Failed"
                     $allSuccessful = $false
                     continue
                 }
@@ -290,7 +297,8 @@ function Process-Manifest {
             # Check exit code (commonly 0 or 3010 for success/reboot required in MSIs)
             if ($exitCode -eq 0 -or $exitCode -eq 3010) {
                 Write-Log -Message "Successfully processed $action for $pkgId"
-                $agentStatus.package_results[$pkgId] = "2-Installation Completed"
+                $agentStatus.package_results[$pkgId] = "Completed"
+                $agentStatus.package_stage[$pkgId] = "Completed"
                 
                 # Cleanup the downloaded custom installer to save space
                 if (-not [string]::IsNullOrEmpty($installerUrl) -and (Test-Path $installerPath)) {
@@ -299,12 +307,14 @@ function Process-Manifest {
                 }
             } else {
                 Write-Log -Message "Failed to $action $pkgId. Exit Code: $exitCode" -Level WARNING
-                $agentStatus.package_results[$pkgId] = "3-Installation Failed"
+                $agentStatus.package_results[$pkgId] = "Failed"
+                $agentStatus.package_stage[$pkgId] = "Failed"
                 $allSuccessful = $false
             }
         } catch {
             Write-Log -Message "Exception occurred while processing $pkgId : $_" -Level ERROR
-            $agentStatus.package_results[$pkgId] = "3-Installation Failed"
+            $agentStatus.package_results[$pkgId] = "Failed"
+            $agentStatus.package_stage[$pkgId] = "Failed"
             $allSuccessful = $false
         }
     }
@@ -346,6 +356,7 @@ while ($true) {
 
             # Clear previous results so we only report status for the currently processing envelope
             $agentStatus.package_results.Clear()
+            $agentStatus.package_stage.Clear()
             $agentStatus.file_metadata.Clear()
 
             $manifestFound = $null
